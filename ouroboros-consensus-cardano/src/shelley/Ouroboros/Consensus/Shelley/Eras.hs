@@ -63,7 +63,7 @@ import qualified Cardano.Ledger.Shelley.LedgerState as SL
 import qualified Cardano.Ledger.Shelley.Rules as SL
 import qualified Cardano.Ledger.Shelley.Transition as SL
 import Control.Monad.Except
-import Control.State.Transition (PredicateFailure)
+import Control.State.Transition (PredicateFailure, ValidationPolicy (..))
 import Data.Data (Proxy (Proxy))
 import Data.List.NonEmpty (NonEmpty ((:|)))
 import qualified Data.List.NonEmpty as NE
@@ -306,18 +306,31 @@ applyAlonzoBasedTx ::
     )
 applyAlonzoBasedTx globals ledgerEnv mempoolState wti tx = do
   (mempoolState', vtx) <-
-    (`catchError` handler) $
-      defaultApplyShelleyBasedTx
-        globals
-        ledgerEnv
-        mempoolState
-        wti
-        intervenedTx
+    (`catchError` handler) $ case wti of
+      -- The scripts were evaluated by the caller against these same inputs:
+      -- run every rule clause but the two-phase one. The validity flag stays
+      -- as declared, as under 'Intervene'.
+      ScriptsJudged ->
+        liftEither $
+          SL.internalApplyTxWithValidation
+            (ValidateSuchThat (notElem Alonzo.lbl2Phase))
+            globals
+            ledgerEnv
+            mempoolState
+            tx
+      _ ->
+        defaultApplyShelleyBasedTx
+          globals
+          ledgerEnv
+          mempoolState
+          wti
+          intervenedTx
   pure (mempoolState', vtx)
  where
   intervenedTx = case wti of
     DoNotIntervene -> tx & Core.isPhase2ValidTxL .~ L.Phase2Valid
     Intervene -> tx
+    ScriptsJudged -> tx
 
   handler e = case (wti, e) of
     (DoNotIntervene, err)

@@ -1670,6 +1670,11 @@ instance
       -- ever reach here (see 'resolveLeiosClosure' above).
       error "assumeValidatedClosureTx: closure tx or ledger state from a non-Dijkstra era"
 
+  leiosScriptsAgree cfg slot st tx = case (tx, matchTickedDijkstra cfg st) of
+    (GenTxDijkstra inner, Just (dijkstraCfg, dijkstraSt)) ->
+      leiosScriptsAgree dijkstraCfg slot dijkstraSt inner
+    _ -> Nothing
+
   -- XXX: cfg is not really needed here
   leiosCurrentProtVer cfg st = case matchTickedDijkstra cfg st of
     Just (dijkstraCfg, dijkstraSt) -> leiosCurrentProtVer dijkstraCfg dijkstraSt

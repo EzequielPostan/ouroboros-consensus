@@ -23,6 +23,7 @@ import Control.Concurrent.Class.MonadSTM.Strict
   , readTVar
   )
 import Control.Monad (filterM, foldM, forever, when)
+import Control.Monad.Class.MonadAsync (forConcurrently)
 import qualified Control.Monad.Class.MonadSTM.Internal as TVar
 import Control.Monad.Class.MonadTimer (MonadTimer, registerDelay)
 import Control.Monad.Class.MonadTimer.SI (diffTimeToMicrosecondsAsInt)
@@ -96,7 +97,7 @@ import Ouroboros.Consensus.Ledger.SupportsMempool
   , TxMeasure (..)
   , TxMeasurePhase1Metrics (..)
   , TxMeasurePhase2Metrics (..)
-  , WhetherToIntervene (Intervene)
+  , WhetherToIntervene (..)
   )
 import Ouroboros.Consensus.Ledger.SupportsProtocol
   ( LedgerSupportsProtocol
@@ -126,6 +127,7 @@ import Ouroboros.Consensus.Storage.LeiosDB
   )
 import Ouroboros.Consensus.Util.IOLike
   ( IOLike
+  , MonadEvaluate (..)
   , MonadMonotonicTime (..)
   , STM
   , atomically
@@ -496,11 +498,45 @@ validateEbClosure lcfg reader txCache resolveValues point lsBase = do
           parity = protVerParity $ leiosCurrentProtVer lcfg st0
       -- Determine which txs we can just reapply (the cache hits)
       decided <- withLookupTx txCache $ \look -> mapM (decide parity look) closure
-      goValidate parity st0 (projectLedgerTables st0) decided 0 0 Measure.zero []
+      let vals0 = projectLedgerTables st0
+      -- The scripts of the txs to apply, judged all at once before the
+      -- sequential pass: each tx's scripts run against the inputs the closure's
+      -- table holds for it, the one state-dependent thing a script context
+      -- needs. A tx whose inputs are not all in the table (a chained one, say)
+      -- reads as not judged and takes the full application in order. One
+      -- thread per slice of the closure rather than per tx: enough slices to
+      -- fill the capabilities, few enough to cost the scheduler nothing.
+      judged <-
+        concat
+          <$> forConcurrently
+            (slices decided)
+            ( mapM $ \(txh, decision) -> case decision of
+                Right tx -> pure (txh, Right tx)
+                Left tx -> do
+                  let stTx = st0 `withLedgerTables` ltliftA2 restrictValuesMK vals0 (getTransactionKeySets tx)
+                  -- forced here, to the Bool: this is the thread that does the work
+                  agree <- case leiosScriptsAgree lcfg slot stTx tx of
+                    Nothing -> pure Nothing
+                    Just b -> Just <$> evaluate b
+                  pure (txh, Left (tx, agree))
+            )
+      goValidate parity st0 vals0 judged 0 0 Measure.zero []
  where
   -- The EB's slot is also its announcer's, so ticking to it mirrors what the
   -- apply path does when a later RB certifies this EB.
   slot = pointSlotNo point
+
+  -- The script pre-pass runs on this many threads, each taking a contiguous
+  -- slice of the closure: enough to fill any host's capabilities, few enough
+  -- to cost the scheduler nothing, and the same count for a closure of a
+  -- hundred txs as for one of ten thousand.
+  judgeThreads = 64 :: Int
+
+  slices xs = go (max 1 ((length xs + judgeThreads - 1) `div` judgeThreads)) xs
+   where
+    go n ys = case splitAt n ys of
+      ([], _) -> []
+      (h, t) -> h : go n t
 
   -- NOTE: The lookup licenses 'assumeValidatedClosureTx': the tag is the
   -- evidence that this tx was validated before, under the protocol version we
@@ -525,7 +561,7 @@ validateEbClosure lcfg reader txCache resolveValues point lsBase = do
     ProtVerParity ->
     TickedLedgerState blk mk ->
     LedgerTables blk ValuesMK ->
-    [(TxHash, Either (GenTx blk) (GenTx blk))] ->
+    [(TxHash, Either (GenTx blk, Maybe Bool) (GenTx blk))] ->
     Int ->
     Int ->
     TxMeasure blk ->
@@ -553,7 +589,7 @@ validateEbClosure lcfg reader txCache resolveValues point lsBase = do
                   applied
                   appliedMeasure
                   newly
-      Left tx ->
+      Left (tx, agree) ->
         -- 'Intervene', despite the mempool's framing of it as a courtesy to
         -- local clients. What it actually selects is whether the era's applyTx
         -- may rewrite the tx's 'isValid' flag: 'DoNotIntervene' forces the flag
@@ -566,7 +602,12 @@ validateEbClosure lcfg reader txCache resolveValues point lsBase = do
         -- exactly the trust 'applyLeiosClosure' cites the certificate for.
         -- 'Intervene' leaves the flag alone and lets the mismatch escape as an
         -- error, so we fail closed on precisely those txs.
-        case runExcept $ applyTx lcfg Intervene slot tx stTx of
+        --
+        -- 'ScriptsJudged' when the concurrent pass found the scripts agreeing
+        -- with the flag: the same checks with the two-phase clause skipped.
+        -- Anything else, including a context the pass could not build, takes
+        -- the full application and its own error.
+        case runExcept $ applyTx lcfg (if agree == Just True then ScriptsJudged else Intervene) slot tx stTx of
           Left err -> abandon parity newly err
           Right (st', _vtx) ->
             goValidate
@@ -586,7 +627,7 @@ validateEbClosure lcfg reader txCache resolveValues point lsBase = do
         `withLedgerTables` ltliftA2
           restrictValuesMK
           vals
-          (getTransactionKeySets (either id id decision))
+          (getTransactionKeySets (either fst id decision))
 
   -- The tx's diff folded into the closure's table: one update per changed
   -- key, where 'applyDiffs' would merge over the whole table.

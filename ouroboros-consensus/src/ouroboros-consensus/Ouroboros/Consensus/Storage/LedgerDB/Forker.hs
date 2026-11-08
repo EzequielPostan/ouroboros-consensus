@@ -871,6 +871,22 @@ class ResolveLeiosBlock blk where
   assumeValidatedClosureTx _ _ _ _ =
     error "assumeValidatedClosureTx: not Leios-enabled for this block type"
 
+  -- | Whether the tx's Plutus scripts, evaluated against the inputs the given
+  -- state holds, agree with the tx's own validity flag: the judgement the
+  -- ledger's two-phase clause makes, taken out of the rule so the voting
+  -- thread can make it for a closure's txs concurrently before applying them
+  -- in order with 'ScriptsJudged'. 'Nothing' when there is no such clause for
+  -- this block type; 'Just False' also when the contexts cannot be built, for
+  -- instance because an input is not in the state -- the caller then falls
+  -- back to the full 'applyTx', which reports the ledger's own error.
+  leiosScriptsAgree ::
+    LedgerConfig blk ->
+    SlotNo ->
+    TickedLedgerState blk ValuesMK ->
+    GenTx blk ->
+    Maybe Bool
+  leiosScriptsAgree _ _ _ _ = Nothing
+
   -- | The parity of the protocol version txs are validated under in this
   -- state; a cached validation under the other parity no longer holds.
   leiosCurrentProtVer :: LedgerConfig blk -> TickedLedgerState blk mk -> ProtVer
