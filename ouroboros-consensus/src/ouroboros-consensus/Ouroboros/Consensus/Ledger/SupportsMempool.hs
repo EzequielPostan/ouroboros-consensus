@@ -100,6 +100,13 @@ data WhetherToIntervene
     -- arrives over NTC, we reject it in order to avoid the ledger penalizing
     -- them for it.
     Intervene
+  | -- | The caller has already evaluated the transaction's Plutus scripts
+    -- against the very inputs this application sees and found them to agree
+    -- with the transaction's validity flag, so the ledger's two-phase clause
+    -- is skipped and every other check runs as under 'Intervene'. Used by the
+    -- Leios voting thread, which evaluates a closure's scripts concurrently
+    -- before applying its transactions in order.
+    ScriptsJudged
   deriving Show
 
 -- | When we are revalidating the transactions in the mempool, we either will

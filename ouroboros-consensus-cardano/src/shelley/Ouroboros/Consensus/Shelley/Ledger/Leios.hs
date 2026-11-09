@@ -15,19 +15,26 @@
 module Ouroboros.Consensus.Shelley.Ledger.Leios () where
 
 import qualified Cardano.Crypto.Hash as Crypto (hashToBytesShort)
+import Cardano.Ledger.Alonzo.Plutus.Evaluate (evalPlutusScripts)
+import Cardano.Ledger.Alonzo.Tx (IsPhase2Valid (..), isPhase2ValidTxL)
+import Cardano.Ledger.Alonzo.UTxO (plutusScriptsWithContextStAnnTx)
 import qualified Cardano.Ledger.Block as Core
+import Cardano.Ledger.Chain (ChainChecksPParams (..))
 import Cardano.Ledger.Core (injectFailure)
 import qualified Cardano.Ledger.Core as Core
 import Cardano.Ledger.Dijkstra.BlockBody (leiosCertBlockBodyL)
 import Cardano.Ledger.Hashes (KeyHash (..))
+import Cardano.Ledger.Plutus.Evaluate (ScriptResult (..))
 import qualified Cardano.Ledger.Shelley.API as SL
 import Cardano.Ledger.Shelley.Rules (ledgerPpL)
 import qualified Cardano.Ledger.Shelley.UTxO as SL
+import qualified Cardano.Protocol.TPraos.API as TP
 import Cardano.Slotting.Slot (SlotNo (..), fromWithOrigin)
 import Control.Monad (foldM, forM)
 import Control.Monad.Except (catchError, throwError)
 import qualified Control.State.Transition as STS
 import Data.Bifunctor (first)
+import Data.Foldable (toList)
 import Data.Function ((&))
 import Data.Maybe.Strict (strictMaybeToMaybe)
 import Data.Proxy (Proxy (..))
@@ -62,12 +69,9 @@ import Ouroboros.Consensus.Protocol.Praos
   , leiosContextFreeHeaderChecks
   )
 import qualified Ouroboros.Consensus.Protocol.Praos as PP
+import Ouroboros.Consensus.Protocol.Praos.Common (WhenLeios)
 import Ouroboros.Consensus.Protocol.Praos.Views (plvPoolDistr)
 import qualified Ouroboros.Consensus.Protocol.Praos.Views as PP
-import Ouroboros.Consensus.Protocol.Praos.Common (WhenLeios)
-import Cardano.Ledger.Chain (ChainChecksPParams (..))
-import qualified Cardano.Protocol.TPraos.API as TP
-import Data.Foldable (toList)
 import Ouroboros.Consensus.Protocol.Praos2
   ( ConsensusConfig (..)
   , LeiosCrypto
@@ -189,6 +193,31 @@ instance
         tx
    where
     innerSt = tickedShelleyLedgerState (stowLedgerTables st)
+
+  -- Exactly the two-phase clause of the UTXOS rule, outside the rule: the
+  -- script contexts the annotated tx carries, built from the inputs the given
+  -- state holds, evaluated with the declared budgets, and the result held
+  -- against the declared validity flag. A context that cannot be built (an
+  -- input missing from the state, say a chained one) reads as disagreement,
+  -- which sends the caller to the full application and its proper error.
+  leiosScriptsAgree cfg slot st (ShelleyTx _ tx) =
+    Just $! case plutusScriptsWithContextStAnnTx stAnn of
+      Left _ -> False
+      Right pwcs -> case evalPlutusScripts pwcs of
+        Passes _ -> tx ^. isPhase2ValidTxL == Phase2Valid
+        Fails _ _ -> tx ^. isPhase2ValidTxL == Phase2Invalid
+   where
+    innerSt = tickedShelleyLedgerState (stowLedgerTables st)
+    globals = shelleyLedgerGlobals cfg
+    env = SL.mkMempoolEnv innerSt slot
+    stAnn =
+      SL.mkStAnnTx
+        (SL.epochInfo globals)
+        (SL.systemStart globals)
+        (env ^. ledgerPpL)
+        (SL.mkMempoolState innerSt ^. SL.utxoG)
+        mempty
+        tx
 
   leiosCurrentProtVer _cfg st =
     getPParams (tickedShelleyLedgerState st) ^. Core.ppProtocolVersionL
