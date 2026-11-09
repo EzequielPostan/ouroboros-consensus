@@ -184,7 +184,7 @@ type DijkstraBlock = ShelleyBlock (Praos2 StandardCrypto) DijkstraEra
 main :: IO ()
 main = do
   hSetBuffering stdout LineBuffering
-  (reps, sizes, plutus, heavy, heavyTxs) <- parseArgs <$> getArgs
+  (reps, sizes, plutus, heavy, heavyTxs, keyCounts) <- parseArgs <$> getArgs
   let coreNode = unGen (genCoreNode (KESPeriod 0)) (mkQCGen 0) 30
   pinfo <- mkProtocolInfo coreNode
   let lcfg = configLedger (pInfoConfig pinfo)
@@ -263,17 +263,38 @@ main = do
         aTx
         r
         rTx
+  -- Multi-key transfers: every tx spends one output of each of k distinct
+  -- keys and pays k outputs, so it carries k signatures and no script --
+  -- old-input shape, at every size given.
+  when (not (null keyCounts)) $ do
+    putStrLn ""
+    putStrLn
+      "| closure | keys (signatures = keys) | txs | tx bytes | table entries | apply: ms | per applied tx, us | reapply: ms | per reapplied tx, us |"
+    putStrLn "|---|---|---|---|---|---|---|---|---|"
+    forM_ sizes $ \n -> forM_ keyCounts $ \k -> do
+      (entries, bytes, a, aTx, r, rTx) <- measure (Keys k) 1 n
+      printf
+        "| keys | %d | %d | %d | %d | %.1f | %.1f | %.1f | %.1f |\n"
+        k
+        n
+        bytes
+        entries
+        a
+        aTx
+        r
+        rTx
  where
-  parseArgs :: [String] -> (Int, [Int], [Integer], [(Int, Integer)], Int)
-  parseArgs = go (3, [], [], [], 100)
+  parseArgs :: [String] -> (Int, [Int], [Integer], [(Int, Integer)], Int, [Int])
+  parseArgs = go (3, [], [], [], 100, [])
    where
-    go (_, acc, pl, hv, ht) ("--reps" : r : rest) = go (read r, acc, pl, hv, ht) rest
-    go (reps, acc, _, hv, ht) ("--plutus" : p : rest) = go (reps, acc, map read (commas p), hv, ht) rest
-    go (reps, acc, pl, _, ht) ("--heavy" : h : rest) = go (reps, acc, pl, map pair (commas h), ht) rest
-    go (reps, acc, pl, hv, _) ("--heavy-txs" : t : rest) = go (reps, acc, pl, hv, read t) rest
-    go (reps, acc, pl, hv, ht) (s : rest) = go (reps, acc ++ [read s], pl, hv, ht) rest
-    go (reps, [], pl, hv, ht) [] = (reps, [1000, 3000, 6000], pl, hv, ht)
-    go (reps, acc, pl, hv, ht) [] = (reps, acc, pl, hv, ht)
+    go (_, acc, pl, hv, ht, ks) ("--reps" : r : rest) = go (read r, acc, pl, hv, ht, ks) rest
+    go (reps, acc, _, hv, ht, ks) ("--plutus" : p : rest) = go (reps, acc, map read (commas p), hv, ht, ks) rest
+    go (reps, acc, pl, _, ht, ks) ("--heavy" : h : rest) = go (reps, acc, pl, map pair (commas h), ht, ks) rest
+    go (reps, acc, pl, hv, _, ks) ("--heavy-txs" : t : rest) = go (reps, acc, pl, hv, read t, ks) rest
+    go (reps, acc, pl, hv, ht, _) ("--keys" : k : rest) = go (reps, acc, pl, hv, ht, map read (commas k)) rest
+    go (reps, acc, pl, hv, ht, ks) (s : rest) = go (reps, acc ++ [read s], pl, hv, ht, ks) rest
+    go (reps, [], pl, hv, ht, ks) [] = (reps, [1000, 3000, 6000], pl, hv, ht, ks)
+    go (reps, acc, pl, hv, ht, ks) [] = (reps, acc, pl, hv, ht, ks)
     commas = words . map (\c -> if c == ',' then ' ' else c)
     pair s = case break (== ':') s of
       (k, ':' : i) -> (read k, read i)
@@ -289,6 +310,9 @@ data Kind
   | -- | Every tx spends one output of each of this many keys and one output
     -- locked by 'loopScript' with this many iterations.
     Heavy Int Integer
+  | -- | Every tx spends one output of each of this many keys and pays as
+    -- many outputs: a transfer with this many signatures, no script.
+    Keys Int
 
 kindName :: Kind -> String
 kindName = \case
@@ -296,6 +320,7 @@ kindName = \case
   Chained -> "chained"
   ScriptLoop _ -> "plutus loop"
   Heavy _ _ -> "heavy"
+  Keys _ -> "keys"
 
 -- | A Plutus V3 script that counts down from @n@ and returns unit, ignoring
 -- its argument: @\\ctx -> (\\_ -> ()) (go n)@ with
@@ -363,10 +388,42 @@ buildClosure ::
 buildClosure CoreNode{cnDelegateKey} pp kind nIn n = case kind of
   ScriptLoop iters -> plutusClosure iters
   Heavy k iters -> heavyClosure k iters
+  Keys k -> keysClosure k
   _ -> (txs, funded)
  where
   addr = Addr networkId (mkCredential cnDelegateKey) StakeRefNull
   fundedOut = mkBasicTxOut addr (inject outputCoin)
+
+  -- k distinct keys, the same ones for every tx of the closure
+  keysOf k =
+    [ genKeyDSIGN
+        (mkSeedFromBytes (BS.replicate 30 0 <> BS.pack [fromIntegral (i `div` 256), fromIntegral i]))
+    | i <- [1 .. k]
+    ]
+  keyOut sk = mkBasicTxOut (Addr networkId (mkCredential sk) StakeRefNull) (inject outputCoin)
+
+  keysClosure k = (kTxs, kFunded)
+   where
+    keys = keysOf k
+    -- tx j's inputs: one output of each key
+    keyIn j i = fundedIn (j * k + i)
+    kFunded =
+      Map.fromList [(BigEndianTxIn (keyIn j i), keyOut sk) | j <- [0 .. n - 1], (i, sk) <- zip [0 ..] keys]
+    kTxs = map keysTx [0 .. n - 1]
+    keysTx :: Int -> Tx TopTx DijkstraEra
+    keysTx j =
+      force $
+        tx0
+          & witsTxL . addrTxWitsL
+            .~ Set.fromList [mkWitnessVKey bodyHash (mkKeyPair sk) | sk <- keys]
+     where
+      tx0 =
+        mkBasicTx
+          ( mkBasicTxBody
+              & inputsTxBodyL .~ Set.fromList [keyIn j i | i <- [0 .. k - 1]]
+              & outputsTxBodyL .~ StrictSeq.fromList (map keyOut keys)
+          )
+      bodyHash = hashAnnotated (tx0 ^. bodyTxL)
 
   mkScript :: Integer -> Script DijkstraEra
   mkScript iters =
@@ -389,12 +446,7 @@ buildClosure CoreNode{cnDelegateKey} pp kind nIn n = case kind of
    where
     script = mkScript iters
     scriptOut = scriptOutOf script
-    keys =
-      [ genKeyDSIGN
-          (mkSeedFromBytes (BS.replicate 30 0 <> BS.pack [fromIntegral (i `div` 256), fromIntegral i]))
-      | i <- [1 .. k]
-      ]
-    keyOut sk = mkBasicTxOut (Addr networkId (mkCredential sk) StakeRefNull) (inject outputCoin)
+    keys = keysOf k
     -- tx j's inputs: k key-locked outputs then the script's; one shared collateral
     keyIn j i = fundedIn (j * (k + 1) + i)
     scriptIn j = fundedIn (j * (k + 1) + k)
