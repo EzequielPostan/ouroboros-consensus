@@ -5,7 +5,9 @@ measured, and why the change is kept as an option rather than proposed with
 the loop fix. The first section names the three loops compared and the
 closures the bench builds. The second reads the bench, whole closures first.
 The third asks what the most expensive closure is under the caps and
-without them, and projects it onto the testnet's hosts. The last two
+without them, and projects it onto the testnet's hosts. The fourth takes
+the EB's reference list as the bound on the transaction count and as the
+unit, and measures the costliest closure per EB size. The last two
 sections say when the change is needed and what stays sequential.
 
 ## The three loops and the closures
@@ -166,13 +168,13 @@ many steps in total. Spending them on transactions at the per-transaction
 cap takes the fewest bytes, and the bytes left over are then best filled
 with the smallest transfers, the densest fixed cost per byte. With caps proportional to mainnet's block,
 232 Gsteps per megabyte of closure, the 1.62 MB closure holds 36 scripts
-at the cap and 8,393 transfers. The testnet's 2026-11-04 proposal, 600
+at the cap and 8,330 transfers. The testnet's 2026-11-04 proposal, 600
 Gsteps per 2 MB closure, is taken at its own size: 60 scripts at the cap
 and the 10,257 transfers that fill 2 MB.
 
 | the costliest closure; seconds to apply all | today | loop fix | fix and pre-pass,<br>2 capabilities | 4 | 8 |
 |---|---:|---:|---:|---:|---:|
-| 1.62 MB under mainnet-proportional caps: 8,393 transfers and 36 scripts at the cap, 360 Gsteps | 13.9 | 0.89 | 0.81 | 0.77 | 0.75 |
+| 1.62 MB under mainnet-proportional caps: 8,330 transfers and 36 scripts at the cap, 360 Gsteps | 13.9 | 0.89 | 0.81 | 0.77 | 0.75 |
 | 1.62 MB, the same 360 Gsteps spread evenly: 4,779 scripts at 75 Msteps, no transfers | 4.5 | 0.72 | 0.63 | 0.60 | 0.59 |
 | 2 MB under the testnet proposal: 10,257 transfers and 60 scripts at the cap, 600 Gsteps | 23.5 | 1.13 | 1.00 | 0.97 | 0.97 |
 | 1.62 MB with the EB step and memory caps lifted, the per-transaction caps alone: 4,779 scripts at the cap, 47,740 Gsteps | 26.3 | 21.6 | 12.0 | 6.9 | 4.3 |
@@ -279,6 +281,157 @@ most of the window on the older hosts, which leaves them little room for
 scripts at any capability count. On every host, for the same time the
 cap can sit two to three times higher on a four-core voter, which is what
 the change buys.
+
+## The reference list bounds the count
+
+The closures above fill their bytes with the smallest transfers, and the
+number of transactions that takes grows with the closure. The EB that
+names them has a bound of its own. The node's codec admits at most 17,142
+references in an EB: the 600 kB design ceiling on the reference list,
+`maxLeiosEbBytesSize`, over the 35 B of the smallest reference,
+`maxTxsPerEb`. The ceiling is a constant because the fetch buffers it
+sizes are allocated before any ledger state can be read, and the node
+refuses to run with a protocol parameter above it. The parameter in force
+on the testnet, 308 kB, admits 8,555 references at the 36 B each takes
+there. A closure of 193 B transfers reaches the codec's count at 3.3 MB
+and the testnet's at 1.65 MB, so above those sizes the bytes cannot be
+filled with the smallest transfers. The 2 MB row above holds 10,317
+transactions and so assumes a reference cap of at least 371 kB.
+
+With the count fixed, the costliest closure makes each transaction
+costlier instead. The bench's multi-key transfer spends one output of each
+of k keys and pays k outputs, so it carries k signatures and no script.
+Each key beyond the first adds 174 B and 28 microseconds, a third of the
+smallest transfer's cost per byte. A second input of the same key adds 73
+B and 5 microseconds. So where the count binds, the extra bytes buy the
+attacker about a third of what the same bytes buy as further transfers.
+
+| transfer | bytes | apply, us | reapply, us |
+|---|---:|---:|---:|
+| one key, one input | 193 | 80 | 45 |
+| one key, two inputs | 266 | 85 | 52 |
+| two keys | 367 | 109 | 51 |
+| three keys | 541 | 137 | 55 |
+| four keys | 715 | 162 | 61 |
+
+Three closures of this kind were measured on the laptop, each as the sum
+of a transfer run and a script run as before. The largest closure the
+codec admits at mainnet's proportion is 77 scripts at the cap and 17,065
+transfers, 3.32 MB and 770 Gsteps. A 7 MB closure under the codec's bound
+holds 162 scripts at the cap, 12,880 two-key and 4,100 three-key
+transfers, 17,142 references. The same 7 MB filled with 35,984 one-key
+transfers needs the ceiling lifted, which was done in the code for the
+measurement alone. The first two closures came within three and seven
+percent of the sum of per-transaction costs measured on 1,000
+transactions, the third ten percent above it.
+
+| closure, seconds to apply all | loop fix | fix and pre-pass,<br>2 capabilities | 4 | 8 |
+|---|---:|---:|---:|---:|
+| 3.32 MB, the codec's 17,142 references: 77 scripts at the cap and 17,065 transfers | 1.76 | 1.63 | 1.53 | 1.55 |
+| 7 MB in 17,142 references: 162 scripts at the cap, 12,880 two-key and 4,100 three-key transfers | 2.82 | 2.44 | 2.23 | 2.25 |
+| 7 MB with the ceiling lifted: 162 scripts at the cap and 35,984 transfers | 4.19 | 3.88 | 3.79 | 3.68 |
+
+The reference bound takes a third off the costliest 7 MB closure and
+keeps it well inside the four seconds, where the unbounded one sits on
+the line. The excess over the prediction is in the transfers: the cost
+per applied transfer is 80 microseconds in a closure of 1,000, 82 to 86
+up to 17,000 and 96 at 36,000, with the same drift in the reapply pass.
+That is a slow rise in the work around the loop at these sizes, not the
+old loop's growth, and it is inside the measured figures above.
+
+### The EB size as the unit
+
+Mainnet's block has a costliest filling of its own under its caps of
+90,112 B and 20 Gsteps: two scripts at the per-transaction cap and 463
+transfers of 193 B, 465 transactions. Fewer transactions under the same
+caps never cost more, because the smallest transfer has the highest fixed
+cost per byte of anything a transaction can carry. A reference list that
+admits exactly 465 transactions, 16.7 kB at 36 B each, is the tightest
+that does not bind the costliest block.
+
+A closure at k times mainnet has k times the bytes and k times the steps,
+so its costliest filling is 2k scripts and 463k transfers and its tightest
+reference list is k times 16.7 kB. Every cap scales by the same factor,
+so the count does too, and the closure's bytes and steps can be read off
+the references alone: 194 B and 43 Msteps per transaction named. An EB of
+R bytes of references then stands for one costliest closure, R over 36
+transactions at that proportion. This is the unit the tables below use.
+
+Read this way, a 2 MB closure at mainnet's proportion needs 371 kB of
+references, a 1.62 MB one 301 kB and a 1 MB one 186 kB. The testnet's 308
+kB sits at the 1.62 MB closure's size and below the 2 MB one's, so on the
+testnet the references bind the costliest 2 MB closure before its bytes
+do, at 8,555 transactions with the spare bytes in keys. The closures the
+cluster runs name at most 2,777 transactions in their 100 kB, below the
+5,181 a 1 MB closure of the smallest transfers holds.
+
+The line can be checked from the other end. Filling the 1 MB, 1.62 MB
+and 2 MB closures at mainnet's proportion with scripts at the cap and
+transfers of 193 B gives 5,163, 8,366 and 10,327 transactions, whose
+references take 186, 301 and 372 kB, against 186, 301 and 371 kB on the
+line. The difference is the bytes the last transfer leaves unfilled,
+under a tenth of a percent.
+
+| EB references | transactions | closure | Gsteps | scripts at the cap, plus one at the remainder | transfers of 193 B |
+|---:|---:|---:|---:|---:|---:|
+| 40 kB | 1,111 | 215 kB | 48 | 4 | 1,106 |
+| 100 kB | 2,777 | 538 kB | 119 | 11 | 2,765 |
+| 200 kB | 5,555 | 1.08 MB | 239 | 23 | 5,531 |
+| 300 kB | 8,333 | 1.61 MB | 358 | 35 | 8,297 |
+| 400 kB | 11,111 | 2.15 MB | 478 | 47 | 11,063 |
+| 500 kB | 13,888 | 2.69 MB | 597 | 59 | 13,828 |
+| 600 kB | 16,666 | 3.23 MB | 717 | 71 | 16,594 |
+
+The step cap is not a multiple of the per-transaction cap, so each row
+spends the remainder on one more script and the steps in full. The 300 kB
+row is the 1.62 MB closure of the sections above within one percent, and
+the 600 kB row is the codec's ceiling.
+
+Each row was measured on the laptop as before, the transfers, the scripts
+at the cap and the remainder script in three runs whose apply times are
+summed, three repetitions each and the minimum taken, one repetition for
+today's loop from 300 kB up. Today's loop grows with the square of the
+size, as the whole table shows at once. The fixed loop costs 2.8 to 3.0
+milliseconds per kB of references from the smallest row to the largest,
+108 microseconds per transaction named at 600 kB, of which the transfer
+is 88 and the scripts' share 20.
+The pre-pass takes the scripts' share down and leaves the rest, so it
+gains a sixth at most, and four capabilities take all of that gain.
+
+| EB references, seconds to apply the costliest closure | today | loop fix | fix and pre-pass,<br>2 capabilities | 4 | 8 |
+|---|---:|---:|---:|---:|---:|
+| 40 kB | 0.30 | 0.11 | 0.11 | 0.11 | 0.11 |
+| 100 kB | 1.50 | 0.28 | 0.26 | 0.24 | 0.25 |
+| 200 kB | 5.8 | 0.58 | 0.54 | 0.49 | 0.51 |
+| 300 kB | 14.6 | 0.88 | 0.78 | 0.74 | 0.77 |
+| 400 kB | 27.7 | 1.18 | 1.05 | 1.01 | 1.02 |
+| 500 kB | 45.6 | 1.48 | 1.30 | 1.25 | 1.28 |
+| 600 kB | 69.1 | 1.80 | 1.57 | 1.51 | 1.54 |
+
+Projected onto the testnet's host generations with the factors of the
+previous section, 2.3, 3.9 and 4.3, the table below gives the largest of
+the seven EB sizes whose costliest closure each host applies within the
+budget, under the same caveats: the loop alone, nothing through the
+mempool, the eight-capability column optimistic on four-core hosts. The
+laptop applies every row within three seconds on the fixed loop.
+
+| host generation and budget | today | loop fix | fix and pre-pass,<br>2 capabilities | 4 | 8 |
+|---|---:|---:|---:|---:|---:|
+| current generation, 4 seconds | 100 kB | 500 kB | 600 kB | 600 kB | 600 kB |
+| current generation, 3 seconds | 40 kB | 400 kB | 500 kB | 500 kB | 500 kB |
+| two generations older, 4 seconds | 40 kB | 300 kB | 300 kB | 400 kB | 400 kB |
+| two generations older, 3 seconds | 40 kB | 200 kB | 200 kB | 300 kB | 200 kB |
+| three generations older, 4 seconds | 40 kB | 300 kB | 300 kB | 300 kB | 300 kB |
+| three generations older, 3 seconds | 40 kB | 200 kB | 200 kB | 200 kB | 200 kB |
+
+Read in this unit, today's loop holds no host above 100 kB of references,
+the loop fix takes the current generation to the codec's ceiling and the
+older ones to 300 kB in four seconds, and the pre-pass moves the current
+generation one size and the generation two steps older one size at four
+capabilities. The oldest generation gains nothing from it, because the
+transfers alone fill its budget. The 300 kB testnet parameter is within
+the fixed loop's reach of every generation in four seconds and of the
+current one in three.
 
 ## Why an option and not part of the fix
 
